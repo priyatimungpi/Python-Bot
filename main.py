@@ -37,19 +37,18 @@ client = TelegramClient('sessions/forwarder_session', api_id, api_hash)
 def remove_mentions(text):
     if not text:
         return text
-    text = re.sub(r'@\w+', '', text)
-    text = re.sub(r'#\w+', '', text)
-    text = re.sub(r'(?i)^.*(credit|via):.*$', '', text, flags=re.MULTILINE)
-    text = re.sub(r'https?://\S+|t\.me/\S+|telegram\.me/\S+', '', text)
-    text = re.sub(r'[ \t]+', ' ', text)
-    text = re.sub(r' *\n *', '\n', text)
-    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r'@\w+', '', text)  # Remove @mentions
+    text = re.sub(r'#\w+', '', text)  # Remove hashtags
+    text = re.sub(r'(?i)^.*(credit|via):.*$', '', text, flags=re.MULTILINE)  # Remove "credit" or "via"
+    text = re.sub(r'https?://\S+|t\.me/\S+|telegram\.me/\S+', '', text)  # Remove links
+    text = re.sub(r'[ \t]+', ' ', text)  # Clean extra spaces/tabs
+    text = re.sub(r' *\n *', '\n', text)  # Clean up newlines
+    text = re.sub(r'\n{3,}', '\n\n', text)  # Collapse too many newlines
     return text.strip()
 
 @client.on(events.NewMessage(chats=source_channels))
 async def handle_all(event):
     chat = event.chat if event.chat else event.message.to_id
-    # Log every message received for debug!
     logging.info(
         f"Received message from: {getattr(chat, 'username', None) or getattr(chat, 'title', None) or chat} "
         f"({event.chat_id}) | Has Media: {event.message.media is not None} | "
@@ -61,22 +60,15 @@ async def forward_message(event):
     try:
         message = event.message
 
-        # 1. First, try native forward (best for media, fastest)
-        try:
-            logging.info(f"Trying native forward from {event.chat.username if event.chat else event.chat_id} to @{destination_channel}")
-            await event.message.forward_to(destination_channel)
-            return  # Success! Done.
-        except Exception as e:
-            logging.warning(f"Native forward failed, trying upload: {e}")
-
-        # 2. If native forward fails (maybe content protection), try sending as file
+        # For media (with or without caption)
         if message.media:
             caption = remove_mentions(message.caption) if message.caption else None
             logging.info(f"Uploading media from {event.chat.username if event.chat else event.chat_id} to @{destination_channel}")
             await client.send_file(destination_channel, file=message.media, caption=caption)
+        # For text-only
         elif message.text:
             clean_text = remove_mentions(message.text)
-            logging.info(f"Forwarding text from {event.chat.username if event.chat else event.chat_id} to @{destination_channel}")
+            logging.info(f"Sending text from {event.chat.username if event.chat else event.chat_id} to @{destination_channel}")
             await client.send_message(destination_channel, clean_text)
         else:
             logging.info(f"Unhandled message type: {message.to_dict()}")
