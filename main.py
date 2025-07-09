@@ -14,7 +14,7 @@ api_hash = os.getenv("API_HASH")
 source_channels = [ch.strip() for ch in os.getenv("SOURCE_CHANNELS", "").split(",") if ch.strip()]
 destination_channel = os.getenv("DEST_CHANNEL")
 
-ADMIN_ID = 123456789  # <-- SET YOUR TELEGRAM USER ID HERE!
+ADMIN_ID = 1121727322  # <-- SET YOUR TELEGRAM USER ID HERE!
 
 forwarding_enabled = True  # Controls if forwarding is paused/running
 
