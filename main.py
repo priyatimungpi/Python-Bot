@@ -51,6 +51,7 @@ async def forward_message(event):
     global forwarding_enabled
     chat = await event.get_chat()
     uname, cid = getattr(chat, "username", None), str(getattr(chat, "id", None))
+    print(f"[DEBUG] New message: uname={uname}, cid={cid}, chat_type={type(chat)}")
     if not ((uname and uname.lower() in source_channels) or (cid in source_channels)): return
     if not forwarding_enabled: return
     try:
