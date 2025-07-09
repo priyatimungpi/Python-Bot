@@ -4,6 +4,7 @@ from telethon.errors import FloodWaitError
 from dotenv import load_dotenv
 from collections import defaultdict
 
+# --- Load env vars
 CONFIG_FILE = "config.json"
 load_dotenv()
 api_id = int(os.getenv("API_ID"))
@@ -13,12 +14,14 @@ initial_dest = os.getenv("DEST_CHANNEL")
 default_admin = int(os.getenv("ADMIN_ID", "1121727322"))
 
 logging.basicConfig(level=logging.WARNING, format='[%(asctime)s] %(levelname)s: %(message)s')
+
 if not all([api_id, api_hash, initial_sources, initial_dest]):
     exit("Missing .env values")
 if not os.path.exists('sessions'): os.makedirs('sessions')
 client = TelegramClient('sessions/forwarder_session', api_id, api_hash)
 forwarding_enabled = True
 
+# --- Config Loader & Saver
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
@@ -30,10 +33,15 @@ def load_config():
 
 def save_config(src, dst, admins):
     with open(CONFIG_FILE, "w") as f:
-        json.dump({"source_channels": [str(x).lower() for x in src], "destination_channel": dst, "admin_ids": list(admins)}, f)
+        json.dump({
+            "source_channels": [str(x).lower() for x in src],
+            "destination_channel": dst,
+            "admin_ids": list(admins)
+        }, f)
 
 source_channels, destination_channel, admin_ids = load_config()
 
+# --- Util: Remove Mentions/Credits/Links
 def remove_mentions(text):
     if not text: return text
     text = re.sub(r'@\w+', '', text)
@@ -44,36 +52,10 @@ def remove_mentions(text):
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
+# --- Album Buffering
 album_buffer, album_last_seen = defaultdict(list), {}
 
-@client.on(events.NewMessage)
-async def forward_message(event):
-    global forwarding_enabled
-    chat = await event.get_chat()
-    uname, cid = getattr(chat, "username", None), str(getattr(chat, "id", None))
-    if not ((uname and uname.lower() in source_channels) or (cid in source_channels)): return
-    if not forwarding_enabled: return
-    try:
-        message = event.message
-        source_name = getattr(chat, 'title', None) or uname or cid
-        tag = f"Source: {source_name}"
-        if message.grouped_id:
-            group_id = (event.chat_id, message.grouped_id)
-            album_buffer[group_id].append((event, tag))
-            album_last_seen[group_id] = time.time()
-            asyncio.create_task(debounce_album_send(group_id))
-        elif message.media:
-            clean_caption = remove_mentions(message.text) if message.text else ""
-            await client.send_file(destination_channel, file=event.message, caption=f"{clean_caption}\n\n{tag}".strip())
-        elif message.text:
-            clean_text = remove_mentions(message.text)
-            await client.send_message(destination_channel, f"{clean_text}\n\n{tag}".strip())
-    except FloodWaitError as e:
-        await asyncio.sleep(e.seconds)
-        await forward_message(event)
-    except Exception as e:
-        logging.error(f"Error forwarding message: {e}")
-
+# --- Album Debounce Handler
 async def debounce_album_send(group_id, debounce_sec=1.5):
     await asyncio.sleep(debounce_sec)
     last = album_last_seen.get(group_id)
@@ -90,6 +72,52 @@ async def process_album(group_id):
     clean_caption = remove_mentions(events_group[0][0].message.text) if events_group[0][0].message.text else ""
     await client.send_file(destination_channel, file=files, caption=f"{clean_caption}\n\n{tag}".strip())
 
+# --- Core Forwarder
+@client.on(events.NewMessage)
+async def forward_message(event):
+    global forwarding_enabled
+    chat = await event.get_chat()
+    uname, cid = getattr(chat, "username", None), str(getattr(chat, "id", None))
+    # Only process from listed sources
+    if not ((uname and uname.lower() in source_channels) or (cid in source_channels)): return
+    if not forwarding_enabled: return
+    try:
+        message = event.message
+        source_name = getattr(chat, 'title', None) or uname or cid
+        tag = f"Source: {source_name}"
+        # Album (grouped) messages
+        if message.grouped_id:
+            group_id = (event.chat_id, message.grouped_id)
+            album_buffer[group_id].append((event, tag))
+            album_last_seen[group_id] = time.time()
+            asyncio.create_task(debounce_album_send(group_id))
+            return
+        # Try fast forward first
+        try:
+            await client.forward_messages(destination_channel, message)
+            return
+        except Exception as forward_err:
+            logging.warning(f"🔁 Forwarding failed, trying manual copy. Reason: {forward_err}")
+        # Fallback: Clean and copy
+        clean_caption = remove_mentions(message.text or message.message or "")
+        final_caption = f"{clean_caption}\n\n{tag}".strip()
+        if message.media:
+            try:
+                await client.send_file(destination_channel, file=message.media, caption=final_caption)
+            except Exception as media_err:
+                logging.error(f"❌ Failed to send media manually: {media_err}")
+        elif message.text:
+            try:
+                await client.send_message(destination_channel, final_caption)
+            except Exception as text_err:
+                logging.error(f"❌ Failed to send text manually: {text_err}")
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds)
+        await forward_message(event)
+    except Exception as e:
+        logging.error(f"❌ Unhandled error in forward_message: {e}")
+
+# --- Admin Commands
 @client.on(events.NewMessage(pattern=r'^/'))
 async def admin_commands(event):
     global forwarding_enabled, source_channels, destination_channel, admin_ids
@@ -133,6 +161,7 @@ async def admin_commands(event):
             except: await event.reply("❌ Usage: /removeadmin <user_id>")
         else: await event.reply("❌ Usage: /removeadmin <user_id> or reply")
         return
+    # --- Backup config
     if cmd == "/backup":
         if os.path.exists(CONFIG_FILE):
             await event.reply("Here is your config.json backup ⬇️")
@@ -140,6 +169,7 @@ async def admin_commands(event):
         else:
             await event.reply("No config.json found to backup.")
         return
+    # --- Restore config
     if cmd == "/restore":
         if event.reply_to_msg_id:
             reply_msg = await event.get_reply_message()
@@ -152,6 +182,7 @@ async def admin_commands(event):
         else:
             await event.reply("Reply to a config.json file with /restore.")
         return
+    # --- Help
     if cmd == "/help":
         await event.reply("Admin:\n/start\n/stop\n/status\n/showconfig\n/addsource <ch>\n/removesource <ch>\n/setdest <ch>\n/addadmin <id> or reply\n/removeadmin <id> or reply\n/backup\n/restore")
     elif cmd == "/start":
@@ -185,6 +216,7 @@ async def admin_commands(event):
         await event.reply(f"✅ Destination set to: {ch}")
     else: await event.reply("❓ Unknown command. Type /help.")
 
+# --- Main entry
 async def main():
     await client.start()
     await client.run_until_disconnected()
