@@ -2,6 +2,7 @@ import asyncio
 import os
 import re
 import json
+import time
 import logging
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
@@ -10,18 +11,16 @@ from collections import defaultdict
 
 CONFIG_FILE = "config.json"
 
-# -- Load initial env (for first run or fallback) --
+# Load .env initial config for first-time run or fallback
 load_dotenv()
 api_id = int(os.getenv("API_ID"))
 api_hash = os.getenv("API_HASH")
 initial_sources = [ch.strip().lower() for ch in os.getenv("SOURCE_CHANNELS", "").split(",") if ch.strip()]
 initial_dest = os.getenv("DEST_CHANNEL")
+default_admin = int(os.getenv("ADMIN_ID", "1121727322"))
 
-ADMIN_ID = 1121727322  # <-- SET YOUR TELEGRAM USER ID HERE!
-
-forwarding_enabled = True  # Controls if forwarding is paused/running
-
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+# Minimal production logging
+logging.basicConfig(level=logging.WARNING, format='[%(asctime)s] %(levelname)s: %(message)s')
 
 if not all([api_id, api_hash, initial_sources, initial_dest]):
     logging.error("Missing one or more required environment variables.")
@@ -31,32 +30,35 @@ if not os.path.exists('sessions'):
     os.makedirs('sessions')
 
 client = TelegramClient('sessions/forwarder_session', api_id, api_hash)
+forwarding_enabled = True  # Controls if forwarding is paused/running
 
-# -- Persistent config --
+# Persistent config
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
                 data = json.load(f)
-                # ensure all sources are lowercase or string (for IDs)
-                return [str(x).lower() for x in data.get("source_channels", [])], data.get("destination_channel")
+                return (
+                    [str(x).lower() for x in data.get("source_channels", [])],
+                    data.get("destination_channel"),
+                    set(int(x) for x in data.get("admin_ids", [default_admin]))
+                )
         except Exception as e:
             logging.error(f"Failed to load config: {e}")
-    # Fallback to .env on first run
-    return initial_sources, initial_dest
+    return initial_sources, initial_dest, set([default_admin])
 
-def save_config(source_channels, destination_channel):
+def save_config(source_channels, destination_channel, admin_ids):
     try:
         with open(CONFIG_FILE, "w") as f:
             json.dump({
-                "source_channels": [str(x).lower() for x in source_channels],  # store as lowercase/string
-                "destination_channel": destination_channel
+                "source_channels": [str(x).lower() for x in source_channels],
+                "destination_channel": destination_channel,
+                "admin_ids": list(admin_ids)
             }, f)
-        logging.info("Config saved to config.json.")
     except Exception as e:
         logging.error(f"Failed to save config: {e}")
 
-source_channels, destination_channel = load_config()
+source_channels, destination_channel, admin_ids = load_config()
 
 def remove_mentions(text):
     if not text:
@@ -69,26 +71,19 @@ def remove_mentions(text):
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
+# Album/Grouped media buffers (with debounce logic)
 album_buffer = defaultdict(list)
-album_tasks = {}
+album_last_seen = {}
 
-# --- DEBUG LOGGING FOR ALL MESSAGES ---
-@client.on(events.NewMessage)
-async def debug_log(event):
-    chat = await event.get_chat()
-    logging.info(f"DEBUG: username={getattr(chat, 'username', None)}, title={getattr(chat, 'title', None)}, id={chat.id}")
-
-# --- Main Forward Handler: filter inside ---
 @client.on(events.NewMessage)
 async def forward_message(event):
-    # --- filter by username or chat id ---
+    global forwarding_enabled
     chat = await event.get_chat()
     uname = getattr(chat, "username", None)
     cid = str(getattr(chat, "id", None))
-    # Check match in config (usernames lower, ids as string)
+    # Only forward from allowed usernames or ids
     if not ((uname and uname.lower() in source_channels) or (cid in source_channels)):
         return
-
     if not forwarding_enabled:
         return
     try:
@@ -96,34 +91,35 @@ async def forward_message(event):
         source_name = getattr(chat, 'title', None) or getattr(chat, 'username', None) or str(chat.id)
         tag = f"Source: {source_name}"
 
-        # Albums/grouped media
+        # Debounced grouped media/album logic
         if message.grouped_id:
             group_id = (event.chat_id, message.grouped_id)
             album_buffer[group_id].append((event, tag))
-            if group_id not in album_tasks:
-                album_tasks[group_id] = asyncio.create_task(process_album(group_id))
+            album_last_seen[group_id] = time.time()
+            asyncio.create_task(debounce_album_send(group_id))
         elif message.media:
             clean_caption = remove_mentions(message.text) if message.text else ""
             caption_with_source = f"{clean_caption}\n\n{tag}".strip()
-            logging.info(f"Forwarding single media from {source_name} to @{destination_channel}")
             await client.send_file(destination_channel, file=event.message, caption=caption_with_source)
         elif message.text:
             clean_text = remove_mentions(message.text)
             text_with_source = f"{clean_text}\n\n{tag}".strip()
-            logging.info(f"Forwarding text from {source_name} to @{destination_channel}")
             await client.send_message(destination_channel, text_with_source)
-        else:
-            logging.info(f"Unknown message type from {source_name} - skipping.")
     except FloodWaitError as e:
-        logging.warning(f"Hit rate limit. Sleeping for {e.seconds} seconds.")
         await asyncio.sleep(e.seconds)
+        await forward_message(event)
     except Exception as e:
         logging.error(f"Error forwarding message: {e}")
 
+async def debounce_album_send(group_id, debounce_sec=1.5):
+    await asyncio.sleep(debounce_sec)
+    last = album_last_seen.get(group_id)
+    if last and time.time() - last >= debounce_sec:
+        await process_album(group_id)
+        album_last_seen.pop(group_id, None)
+
 async def process_album(group_id):
-    await asyncio.sleep(1.0)
     events_group = album_buffer.pop(group_id, [])
-    album_tasks.pop(group_id, None)
     if not events_group:
         return
     events_group.sort(key=lambda x: x[0].message.id)
@@ -131,16 +127,20 @@ async def process_album(group_id):
     tag = events_group[0][1]
     clean_caption = remove_mentions(events_group[0][0].message.text) if events_group[0][0].message.text else ""
     caption_with_source = f"{clean_caption}\n\n{tag}".strip()
-    logging.info(f"Forwarding album (grouped_id={group_id[1]}) with {len(files)} media from chat {group_id[0]} to @{destination_channel}")
     try:
         await client.send_file(destination_channel, file=files, caption=caption_with_source)
     except Exception as e:
         logging.error(f"Error forwarding album: {e}")
 
-@client.on(events.NewMessage(from_users=ADMIN_ID))
+@client.on(events.NewMessage(pattern=r'^/'))
 async def admin_commands(event):
-    global forwarding_enabled, source_channels, destination_channel
+    global forwarding_enabled, source_channels, destination_channel, admin_ids
+    sender = event.sender_id
     cmd = event.raw_text.strip()
+
+    # Only allow commands from admins
+    if sender not in admin_ids:
+        return
 
     # --- Backup command ---
     if cmd == "/backup":
@@ -157,12 +157,80 @@ async def admin_commands(event):
             reply_msg = await event.get_reply_message()
             if reply_msg and reply_msg.file:
                 await reply_msg.download_media(CONFIG_FILE)
-                source_channels, destination_channel = load_config()
+                source_channels, destination_channel, admin_ids = load_config()
                 await event.reply("✅ Config restored from uploaded file!")
             else:
                 await event.reply("Please reply to a config.json file with /restore.")
         else:
             await event.reply("Reply to a config.json file with /restore.")
+        return
+
+    # --- Add admin: by user_id or reply ---
+    if cmd.startswith("/addadmin"):
+        if event.reply_to_msg_id:
+            reply_msg = await event.get_reply_message()
+            if reply_msg:
+                new_admin = reply_msg.sender_id
+                if new_admin in admin_ids:
+                    await event.reply(f"User ID {new_admin} is already an admin.")
+                else:
+                    admin_ids.add(new_admin)
+                    save_config(source_channels, destination_channel, admin_ids)
+                    await event.reply(f"✅ Added admin by reply: `{new_admin}` (Saved to config.json)")
+            else:
+                await event.reply("❌ Error: could not find replied user.")
+        else:
+            parts = cmd.split()
+            if len(parts) == 2:
+                try:
+                    new_admin = int(parts[1])
+                except Exception:
+                    await event.reply("❌ Usage: /addadmin <user_id>")
+                    return
+                if new_admin in admin_ids:
+                    await event.reply(f"User ID {new_admin} is already an admin.")
+                else:
+                    admin_ids.add(new_admin)
+                    save_config(source_channels, destination_channel, admin_ids)
+                    await event.reply(f"✅ Added admin: `{new_admin}` (Saved to config.json)")
+            else:
+                await event.reply("❌ Usage: /addadmin <user_id> or reply to a user with /addadmin")
+        return
+
+    # --- Remove admin: by user_id or reply ---
+    if cmd.startswith("/removeadmin"):
+        if event.reply_to_msg_id:
+            reply_msg = await event.get_reply_message()
+            if reply_msg:
+                remove_admin = reply_msg.sender_id
+                if remove_admin not in admin_ids:
+                    await event.reply(f"User ID {remove_admin} is not an admin.")
+                elif len(admin_ids) == 1:
+                    await event.reply("❌ At least one admin must remain.")
+                else:
+                    admin_ids.remove(remove_admin)
+                    save_config(source_channels, destination_channel, admin_ids)
+                    await event.reply(f"✅ Removed admin by reply: `{remove_admin}` (Saved to config.json)")
+            else:
+                await event.reply("❌ Error: could not find replied user.")
+        else:
+            parts = cmd.split()
+            if len(parts) == 2:
+                try:
+                    remove_admin = int(parts[1])
+                except Exception:
+                    await event.reply("❌ Usage: /removeadmin <user_id>")
+                    return
+                if remove_admin not in admin_ids:
+                    await event.reply(f"User ID {remove_admin} is not an admin.")
+                elif len(admin_ids) == 1:
+                    await event.reply("❌ At least one admin must remain.")
+                else:
+                    admin_ids.remove(remove_admin)
+                    save_config(source_channels, destination_channel, admin_ids)
+                    await event.reply(f"✅ Removed admin: `{remove_admin}` (Saved to config.json)")
+            else:
+                await event.reply("❌ Usage: /removeadmin <user_id> or reply to a user with /removeadmin")
         return
 
     # ---- Standard admin commands below ----
@@ -175,6 +243,8 @@ async def admin_commands(event):
                           "/addsource <channel or chat_id>\n"
                           "/removesource <channel or chat_id>\n"
                           "/setdest <channel>\n"
+                          "/addadmin <user_id> or reply to user\n"
+                          "/removeadmin <user_id> or reply to user\n"
                           "/backup - Download config.json\n"
                           "/restore (reply to file) - Restore config.json")
     elif cmd == "/start":
@@ -187,12 +257,12 @@ async def admin_commands(event):
         status = "enabled ✅" if forwarding_enabled else "paused ⛔"
         await event.reply(f"Bot forwarding is currently *{status}*.")
     elif cmd == "/showconfig":
-        await event.reply(f"Sources: {source_channels}\nDestination: {destination_channel}")
+        await event.reply(f"Sources: {source_channels}\nDestination: {destination_channel}\nAdmins: {list(admin_ids)}")
     elif cmd.startswith("/addsource "):
         ch = cmd.split(maxsplit=1)[1].strip().lower()
         if ch not in source_channels:
             source_channels.append(ch)
-            save_config(source_channels, destination_channel)
+            save_config(source_channels, destination_channel, admin_ids)
             await event.reply(f"✅ Added source channel: {ch} (Saved to config.json!)")
         else:
             await event.reply(f"Channel {ch} already in source list.")
@@ -200,23 +270,20 @@ async def admin_commands(event):
         ch = cmd.split(maxsplit=1)[1].strip().lower()
         if ch in source_channels:
             source_channels.remove(ch)
-            save_config(source_channels, destination_channel)
+            save_config(source_channels, destination_channel, admin_ids)
             await event.reply(f"✅ Removed source channel: {ch} (Saved to config.json!)")
         else:
             await event.reply(f"Channel {ch} not found in source list.")
     elif cmd.startswith("/setdest "):
         ch = cmd.split(maxsplit=1)[1].strip()
         destination_channel = ch
-        save_config(source_channels, destination_channel)
+        save_config(source_channels, destination_channel, admin_ids)
         await event.reply(f"✅ Destination set to: {ch} (Saved to config.json!)")
     else:
         await event.reply("❓ Unknown command. Type /help.")
 
 async def main():
-    logging.info("🔄 Starting Telegram client...")
     await client.start()
-    logging.info("✅ Logged in successfully!")
-    logging.info(f"👂 Listening to: {', '.join(source_channels)}")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
@@ -225,4 +292,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logging.info("🔌 Bot stopped by user.")
+        pass
