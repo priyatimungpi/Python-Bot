@@ -36,29 +36,32 @@ client = TelegramClient('sessions/forwarder_session', api_id, api_hash)
 def remove_mentions(text):
     if not text:
         return text
-    text = re.sub(r'@\w+', '', text)                          # Remove @mentions
-    text = re.sub(r'#\w+', '', text)                          # Remove hashtags
-    text = re.sub(r'(?i)^.*(credit|via):.*$', '', text, flags=re.MULTILINE) # Remove "credit" or "via"
-    text = re.sub(r'https?://\S+|t\.me/\S+|telegram\.me/\S+', '', text)     # Remove links
-    text = re.sub(r'[ \t]+', ' ', text)                       # Collapse spaces/tabs but not newlines
-    text = re.sub(r' *\n *', '\n', text)                      # Clean up spaces around newlines
-    text = re.sub(r'\n{3,}', '\n\n', text)                    # Collapse too many newlines
+    text = re.sub(r'@\w+', '', text)
+    text = re.sub(r'#\w+', '', text)
+    text = re.sub(r'(?i)^.*(credit|via):.*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'https?://\S+|t\.me/\S+|telegram\.me/\S+', '', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r' *\n *', '\n', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
 async def forward_message(event):
     try:
         message = event.message
 
-        # Forward media (image, video, docs) with or without caption
-        if message.media:
-            caption = remove_mentions(message.caption) if message.caption else None
-            logging.info(f"Forwarding media from {event.chat.username} to @{destination_channel}")
-            await client.send_file(destination_channel, file=message.media, caption=caption)
-        # Forward plain text
-        elif message.text:
+        if message.text:
             clean_text = remove_mentions(message.text)
             logging.info(f"Forwarding text from {event.chat.username} to @{destination_channel}")
             await client.send_message(destination_channel, clean_text)
+
+        elif message.media and message.caption:
+            clean_caption = remove_mentions(message.caption)
+            logging.info(f"Forwarding media+caption from {event.chat.username} to @{destination_channel}")
+            await client.send_file(destination_channel, file=message.media, caption=clean_caption)
+
+        elif message.media:
+            logging.info(f"Forwarding media from {event.chat.username} to @{destination_channel}")
+            await client.send_file(destination_channel, file=message.media)
 
     except FloodWaitError as e:
         logging.warning(f"Hit rate limit. Sleeping for {e.seconds} seconds.")
