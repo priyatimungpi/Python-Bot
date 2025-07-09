@@ -7,7 +7,10 @@ from telethon.errors import FloodWaitError
 from dotenv import load_dotenv
 from collections import defaultdict
 
+<<<<<<< HEAD
 # --- Load ENV variables ---
+=======
+>>>>>>> 3ead1ebc11e5bbf4d6afee0c2a4b8aa8c39e1ff8
 load_dotenv()
 api_id = int(os.getenv("API_ID"))
 api_hash = os.getenv("API_HASH")
@@ -52,7 +55,11 @@ async def forward_message(event):
         # Handle grouped (album) media
         if message.grouped_id:
             group_id = (event.chat_id, message.grouped_id)
+<<<<<<< HEAD
             album_buffer[group_id].append((event, tag))  # Save tag for the album
+=======
+            album_buffer[group_id].append(event)
+>>>>>>> 3ead1ebc11e5bbf4d6afee0c2a4b8aa8c39e1ff8
             # Cancel any previous task for this album group (debounce)
             if group_id in album_tasks:
                 album_tasks[group_id].cancel()
@@ -60,6 +67,7 @@ async def forward_message(event):
             album_tasks[group_id] = asyncio.create_task(process_album(group_id))
         # Single media
         elif message.media:
+<<<<<<< HEAD
             clean_caption = remove_mentions(message.text) if message.text else ""
             caption_with_source = f"{clean_caption}\n\n{tag}".strip()
             logging.info(f"Forwarding single media from {source_name} to @{destination_channel}")
@@ -72,6 +80,18 @@ async def forward_message(event):
             await client.send_message(destination_channel, text_with_source)
         else:
             logging.info(f"Unknown message type from {source_name} - skipping.")
+=======
+            clean_caption = remove_mentions(message.text) if message.text else None
+            logging.info(f"Forwarding single media from {event.chat.username} to @{destination_channel}")
+            await client.send_file(destination_channel, file=event.message, caption=clean_caption)
+        # Plain text
+        elif message.text:
+            clean_text = remove_mentions(message.text)
+            logging.info(f"Forwarding text from {event.chat.username} to @{destination_channel}")
+            await client.send_message(destination_channel, clean_text)
+        else:
+            logging.info(f"Unknown message type from {event.chat.username} - skipping.")
+>>>>>>> 3ead1ebc11e5bbf4d6afee0c2a4b8aa8c39e1ff8
     except FloodWaitError as e:
         logging.warning(f"Hit rate limit. Sleeping for {e.seconds} seconds.")
         await asyncio.sleep(e.seconds)
@@ -83,6 +103,7 @@ async def process_album(group_id):
     events_group = album_buffer.pop(group_id, [])
     if not events_group:
         return
+<<<<<<< HEAD
     events_group.sort(key=lambda x: x[0].message.id)  # maintain order
     files = [e.message for e, _ in events_group]
     tag = events_group[0][1]  # Get tag from first event
@@ -91,6 +112,14 @@ async def process_album(group_id):
     logging.info(f"Forwarding album (grouped_id={group_id[1]}) with {len(files)} media from chat {group_id[0]} to @{destination_channel}")
     try:
         await client.send_file(destination_channel, file=files, caption=caption_with_source)
+=======
+    events_group.sort(key=lambda e: e.message.id)  # maintain order
+    files = [e.message for e in events_group]
+    caption = remove_mentions(events_group[0].message.text) if events_group[0].message.text else None
+    logging.info(f"Forwarding album (grouped_id={group_id[1]}) with {len(files)} media from chat {group_id[0]} to @{destination_channel}")
+    try:
+        await client.send_file(destination_channel, file=files, caption=caption)
+>>>>>>> 3ead1ebc11e5bbf4d6afee0c2a4b8aa8c39e1ff8
     except Exception as e:
         logging.error(f"Error forwarding album: {e}")
 
