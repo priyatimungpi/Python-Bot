@@ -11,7 +11,7 @@ from collections import defaultdict
 
 CONFIG_FILE = "config.json"
 
-# Load .env initial config for first-time run or fallback
+# Load .env
 load_dotenv()
 api_id = int(os.getenv("API_ID"))
 api_hash = os.getenv("API_HASH")
@@ -19,7 +19,6 @@ initial_sources = [ch.strip().lower() for ch in os.getenv("SOURCE_CHANNELS", "")
 initial_dest = os.getenv("DEST_CHANNEL")
 default_admin = int(os.getenv("ADMIN_ID", "1121727322"))
 
-# Minimal production logging
 logging.basicConfig(level=logging.WARNING, format='[%(asctime)s] %(levelname)s: %(message)s')
 
 if not all([api_id, api_hash, initial_sources, initial_dest]):
@@ -30,9 +29,9 @@ if not os.path.exists('sessions'):
     os.makedirs('sessions')
 
 client = TelegramClient('sessions/forwarder_session', api_id, api_hash)
-forwarding_enabled = True  # Controls if forwarding is paused/running
+forwarding_enabled = True
 
-# Persistent config
+# --- Persistent config with multi-admin ---
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
@@ -71,7 +70,7 @@ def remove_mentions(text):
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
-# Album/Grouped media buffers (with debounce logic)
+# --- Robust album (grouped media) debouncing ---
 album_buffer = defaultdict(list)
 album_last_seen = {}
 
@@ -91,7 +90,7 @@ async def forward_message(event):
         source_name = getattr(chat, 'title', None) or getattr(chat, 'username', None) or str(chat.id)
         tag = f"Source: {source_name}"
 
-        # Debounced grouped media/album logic
+        # Robust grouped media/album debouncing
         if message.grouped_id:
             group_id = (event.chat_id, message.grouped_id)
             album_buffer[group_id].append((event, tag))
@@ -132,40 +131,17 @@ async def process_album(group_id):
     except Exception as e:
         logging.error(f"Error forwarding album: {e}")
 
+# --- Admin commands, only handle '/' and from admin! ---
 @client.on(events.NewMessage(pattern=r'^/'))
 async def admin_commands(event):
     global forwarding_enabled, source_channels, destination_channel, admin_ids
     sender = event.sender_id
     cmd = event.raw_text.strip()
 
-    # Only allow commands from admins
     if sender not in admin_ids:
         return
 
-    # --- Backup command ---
-    if cmd == "/backup":
-        if os.path.exists(CONFIG_FILE):
-            await event.reply("Here is your config.json backup ⬇️")
-            await client.send_file(event.chat_id, CONFIG_FILE)
-        else:
-            await event.reply("No config.json found to backup.")
-        return
-
-    # --- Restore command ---
-    if cmd == "/restore":
-        if event.reply_to_msg_id:
-            reply_msg = await event.get_reply_message()
-            if reply_msg and reply_msg.file:
-                await reply_msg.download_media(CONFIG_FILE)
-                source_channels, destination_channel, admin_ids = load_config()
-                await event.reply("✅ Config restored from uploaded file!")
-            else:
-                await event.reply("Please reply to a config.json file with /restore.")
-        else:
-            await event.reply("Reply to a config.json file with /restore.")
-        return
-
-    # --- Add admin: by user_id or reply ---
+    # --- Add admin by user ID or reply ---
     if cmd.startswith("/addadmin"):
         if event.reply_to_msg_id:
             reply_msg = await event.get_reply_message()
@@ -177,27 +153,24 @@ async def admin_commands(event):
                     admin_ids.add(new_admin)
                     save_config(source_channels, destination_channel, admin_ids)
                     await event.reply(f"✅ Added admin by reply: `{new_admin}` (Saved to config.json)")
-            else:
-                await event.reply("❌ Error: could not find replied user.")
         else:
             parts = cmd.split()
             if len(parts) == 2:
                 try:
                     new_admin = int(parts[1])
+                    if new_admin in admin_ids:
+                        await event.reply(f"User ID {new_admin} is already an admin.")
+                    else:
+                        admin_ids.add(new_admin)
+                        save_config(source_channels, destination_channel, admin_ids)
+                        await event.reply(f"✅ Added admin: `{new_admin}` (Saved to config.json)")
                 except Exception:
                     await event.reply("❌ Usage: /addadmin <user_id>")
-                    return
-                if new_admin in admin_ids:
-                    await event.reply(f"User ID {new_admin} is already an admin.")
-                else:
-                    admin_ids.add(new_admin)
-                    save_config(source_channels, destination_channel, admin_ids)
-                    await event.reply(f"✅ Added admin: `{new_admin}` (Saved to config.json)")
             else:
-                await event.reply("❌ Usage: /addadmin <user_id> or reply to a user with /addadmin")
+                await event.reply("❌ Usage: /addadmin <user_id> or reply to user")
         return
 
-    # --- Remove admin: by user_id or reply ---
+    # --- Remove admin by user ID or reply ---
     if cmd.startswith("/removeadmin"):
         if event.reply_to_msg_id:
             reply_msg = await event.get_reply_message()
@@ -211,26 +184,45 @@ async def admin_commands(event):
                     admin_ids.remove(remove_admin)
                     save_config(source_channels, destination_channel, admin_ids)
                     await event.reply(f"✅ Removed admin by reply: `{remove_admin}` (Saved to config.json)")
-            else:
-                await event.reply("❌ Error: could not find replied user.")
         else:
             parts = cmd.split()
             if len(parts) == 2:
                 try:
                     remove_admin = int(parts[1])
+                    if remove_admin not in admin_ids:
+                        await event.reply(f"User ID {remove_admin} is not an admin.")
+                    elif len(admin_ids) == 1:
+                        await event.reply("❌ At least one admin must remain.")
+                    else:
+                        admin_ids.remove(remove_admin)
+                        save_config(source_channels, destination_channel, admin_ids)
+                        await event.reply(f"✅ Removed admin: `{remove_admin}` (Saved to config.json)")
                 except Exception:
                     await event.reply("❌ Usage: /removeadmin <user_id>")
-                    return
-                if remove_admin not in admin_ids:
-                    await event.reply(f"User ID {remove_admin} is not an admin.")
-                elif len(admin_ids) == 1:
-                    await event.reply("❌ At least one admin must remain.")
-                else:
-                    admin_ids.remove(remove_admin)
-                    save_config(source_channels, destination_channel, admin_ids)
-                    await event.reply(f"✅ Removed admin: `{remove_admin}` (Saved to config.json)")
             else:
-                await event.reply("❌ Usage: /removeadmin <user_id> or reply to a user with /removeadmin")
+                await event.reply("❌ Usage: /removeadmin <user_id> or reply to user")
+        return
+
+    # --- Backup/Restore and all the rest ---
+    if cmd == "/backup":
+        if os.path.exists(CONFIG_FILE):
+            await event.reply("Here is your config.json backup ⬇️")
+            await client.send_file(event.chat_id, CONFIG_FILE)
+        else:
+            await event.reply("No config.json found to backup.")
+        return
+
+    if cmd == "/restore":
+        if event.reply_to_msg_id:
+            reply_msg = await event.get_reply_message()
+            if reply_msg and reply_msg.file:
+                await reply_msg.download_media(CONFIG_FILE)
+                source_channels, destination_channel, admin_ids = load_config()
+                await event.reply("✅ Config restored from uploaded file!")
+            else:
+                await event.reply("Please reply to a config.json file with /restore.")
+        else:
+            await event.reply("Reply to a config.json file with /restore.")
         return
 
     # ---- Standard admin commands below ----
