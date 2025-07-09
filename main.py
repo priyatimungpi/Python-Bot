@@ -6,72 +6,62 @@ from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from dotenv import load_dotenv
 
-# Load .env config
+# Load environment variables from .env file if present
 load_dotenv()
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
-logging.getLogger("telethon").setLevel(logging.WARNING)  # Clean up Telethon internal logs
 
-# Env variables
+# Environment configs
 try:
     api_id = int(os.getenv("API_ID"))
     api_hash = os.getenv("API_HASH")
-    # Accept both usernames and numeric IDs
     source_channels = [ch.strip() for ch in os.getenv("SOURCE_CHANNELS", "").split(",") if ch.strip()]
-    source_channels = [int(ch) if ch.isdigit() else ch for ch in source_channels]
     destination_channel = os.getenv("DEST_CHANNEL")
 
     if not all([api_id, api_hash, source_channels, destination_channel]):
         raise ValueError("Missing one or more required environment variables.")
+
 except Exception as e:
     logging.error(f"Error loading environment variables: {e}")
     exit(1)
 
-# Make sure session folder exists
+# Create Telegram session folder if needed
 if not os.path.exists('sessions'):
     os.makedirs('sessions')
 
+# Create Telegram client
 client = TelegramClient('sessions/forwarder_session', api_id, api_hash)
 
 def remove_mentions(text):
     if not text:
         return text
-    text = re.sub(r'@\w+', '', text)  # Remove @mentions
-    text = re.sub(r'#\w+', '', text)  # Remove hashtags
-    text = re.sub(r'(?i)^.*(credit|via):.*$', '', text, flags=re.MULTILINE)  # Remove "credit" or "via"
-    text = re.sub(r'https?://\S+|t\.me/\S+|telegram\.me/\S+', '', text)  # Remove links
-    text = re.sub(r'[ \t]+', ' ', text)  # Clean extra spaces/tabs
-    text = re.sub(r' *\n *', '\n', text)  # Clean up newlines
-    text = re.sub(r'\n{3,}', '\n\n', text)  # Collapse too many newlines
+    text = re.sub(r'@\w+', '', text)
+    text = re.sub(r'#\w+', '', text)
+    text = re.sub(r'(?i)^.*(credit|via):.*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'https?://\S+|t\.me/\S+|telegram\.me/\S+', '', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r' *\n *', '\n', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
-
-@client.on(events.NewMessage(chats=source_channels))
-async def handle_all(event):
-    chat = event.chat if event.chat else event.message.to_id
-    logging.info(
-        f"Received message from: {getattr(chat, 'username', None) or getattr(chat, 'title', None) or chat} "
-        f"({event.chat_id}) | Has Media: {event.message.media is not None} | "
-        f"Text: {event.message.text[:40] if event.message.text else ''}"
-    )
-    await forward_message(event)
 
 async def forward_message(event):
     try:
         message = event.message
 
-        # For media (with or without caption)
-        if message.media:
-            caption = remove_mentions(message.caption) if message.caption else None
-            logging.info(f"Uploading media from {event.chat.username if event.chat else event.chat_id} to @{destination_channel}")
-            await client.send_file(destination_channel, file=message.media, caption=caption)
-        # For text-only
-        elif message.text:
+        if message.text:
             clean_text = remove_mentions(message.text)
-            logging.info(f"Sending text from {event.chat.username if event.chat else event.chat_id} to @{destination_channel}")
+            logging.info(f"Forwarding text from {event.chat.username} to @{destination_channel}")
             await client.send_message(destination_channel, clean_text)
-        else:
-            logging.info(f"Unhandled message type: {message.to_dict()}")
+
+        elif message.media and message.caption:
+            clean_caption = remove_mentions(message.caption)
+            logging.info(f"Forwarding media+caption from {event.chat.username} to @{destination_channel}")
+            await client.send_file(destination_channel, file=message.media, caption=clean_caption)
+
+        elif message.media:
+            logging.info(f"Forwarding media from {event.chat.username} to @{destination_channel}")
+            await client.send_file(destination_channel, file=message.media)
 
     except FloodWaitError as e:
         logging.warning(f"Hit rate limit. Sleeping for {e.seconds} seconds.")
@@ -82,13 +72,15 @@ async def forward_message(event):
 async def main():
     logging.info("🔄 Starting Telegram client...")
     await client.start()
-    logging.info(f"✅ Logged in successfully! Session is user: {not client.is_bot}")
+    logging.info("✅ Logged in successfully!")
 
-    logging.info(f"👂 Listening to: {', '.join([str(ch) for ch in source_channels])}")
+    client.add_event_handler(forward_message, events.NewMessage(chats=source_channels))
+
+    logging.info(f"👂 Listening to: {', '.join(source_channels)}")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    if os.name == 'nt':
+    if os.name == 'nt':  # Windows
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     try:
         asyncio.run(main())
