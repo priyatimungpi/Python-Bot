@@ -5,6 +5,7 @@ import logging
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from dotenv import load_dotenv
+from collections import defaultdict
 
 load_dotenv()
 api_id = int(os.getenv("API_ID"))
@@ -35,16 +36,30 @@ def remove_mentions(text):
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
+# Buffer to collect grouped media (albums)
+album_buffer = defaultdict(list)
+album_tasks = {}
+
 @client.on(events.NewMessage(chats=source_channels))
 async def forward_message(event):
     try:
         message = event.message
-        # Media messages (photo, video, document, etc.)
-        if message.media:
+
+        # Handle grouped (album) media
+        if message.grouped_id:
+            group_id = (event.chat_id, message.grouped_id)
+            album_buffer[group_id].append(event)
+            # Cancel any previous task for this album group (debounce)
+            if group_id in album_tasks:
+                album_tasks[group_id].cancel()
+            # Set a delayed send (waits 1s for all parts to arrive)
+            album_tasks[group_id] = asyncio.create_task(process_album(group_id))
+        # Single media
+        elif message.media:
             clean_caption = remove_mentions(message.text) if message.text else None
-            logging.info(f"Forwarding media from {event.chat.username} to @{destination_channel}")
+            logging.info(f"Forwarding single media from {event.chat.username} to @{destination_channel}")
             await client.send_file(destination_channel, file=event.message, caption=clean_caption)
-        # Plain text messages
+        # Plain text
         elif message.text:
             clean_text = remove_mentions(message.text)
             logging.info(f"Forwarding text from {event.chat.username} to @{destination_channel}")
@@ -56,6 +71,20 @@ async def forward_message(event):
         await asyncio.sleep(e.seconds)
     except Exception as e:
         logging.error(f"Error forwarding message: {e}")
+
+async def process_album(group_id):
+    await asyncio.sleep(1.0)  # Wait for the rest of the album to arrive
+    events_group = album_buffer.pop(group_id, [])
+    if not events_group:
+        return
+    events_group.sort(key=lambda e: e.message.id)  # maintain order
+    files = [e.message for e in events_group]
+    caption = remove_mentions(events_group[0].message.text) if events_group[0].message.text else None
+    logging.info(f"Forwarding album (grouped_id={group_id[1]}) with {len(files)} media from chat {group_id[0]} to @{destination_channel}")
+    try:
+        await client.send_file(destination_channel, files=files, caption=caption)
+    except Exception as e:
+        logging.error(f"Error forwarding album: {e}")
 
 async def main():
     logging.info("🔄 Starting Telegram client...")
