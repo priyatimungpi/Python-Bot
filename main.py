@@ -82,7 +82,7 @@ async def process_album(group_id):
     caption = remove_mentions(events_group[0].message.text) if events_group[0].message.text else None
     logging.info(f"Forwarding album (grouped_id={group_id[1]}) with {len(files)} media from chat {group_id[0]} to @{destination_channel}")
     try:
-        await client.send_file(destination_channel, files=files, caption=caption)
+        await client.send_file(destination_channel, file=files, caption=caption)
     except Exception as e:
         logging.error(f"Error forwarding album: {e}")
 
