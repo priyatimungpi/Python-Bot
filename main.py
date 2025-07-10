@@ -16,12 +16,12 @@ load_dotenv()
 api_id = int(os.getenv("API_ID"))
 api_hash = os.getenv("API_HASH")
 initial_sources = [ch.strip() for ch in os.getenv("SOURCE_CHANNELS", "").split(",") if ch.strip()]
-initial_dest = os.getenv("DEST_CHANNEL")
+initial_dest = [ch.strip() for ch in os.getenv("DEST_CHANNELS", "").split(",") if ch.strip()]
 default_admin = int(os.getenv("ADMIN_ID", "1121727322"))
 
 logging.basicConfig(level=logging.WARNING, format='[%(asctime)s] %(levelname)s: %(message)s')
 
-if not all([api_id, api_hash, initial_dest]):
+if not all([api_id, api_hash]):
     logging.error("Missing one or more required environment variables.")
     exit(1)
 
@@ -31,17 +31,17 @@ if not os.path.exists('sessions'):
 client = TelegramClient('sessions/forwarder_session', api_id, api_hash)
 forwarding_enabled = True
 
-# --- Config with show_source toggle ---
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
                 data = json.load(f)
                 sources = [dict(x) for x in data.get("source_channels", [])]
+                dests = data.get("destination_channels", [])
                 show_source = data.get("show_source", True)
                 return (
                     sources,
-                    data.get("destination_channel"),
+                    dests,
                     set(int(x) for x in data.get("admin_ids", [default_admin])),
                     show_source
                 )
@@ -49,19 +49,19 @@ def load_config():
             logging.error(f"Failed to load config: {e}")
     return [], initial_dest, set([default_admin]), True
 
-def save_config(source_channels, destination_channel, admin_ids, show_source):
+def save_config(source_channels, destination_channels, admin_ids, show_source):
     try:
         with open(CONFIG_FILE, "w") as f:
             json.dump({
                 "source_channels": [dict(x) for x in source_channels],
-                "destination_channel": destination_channel,
+                "destination_channels": destination_channels,
                 "admin_ids": list(admin_ids),
                 "show_source": show_source
             }, f, indent=2)
     except Exception as e:
         logging.error(f"Failed to save config: {e}")
 
-source_channels, destination_channel, admin_ids, show_source = load_config()
+source_channels, destination_channels, admin_ids, show_source = load_config()
 
 def remove_mentions(text):
     if not text:
@@ -77,7 +77,6 @@ def remove_mentions(text):
 def is_channel_allowed(cid):
     return any(str(cid) == str(sc['id']) for sc in source_channels)
 
-# --- Album debouncing ---
 album_buffer = defaultdict(list)
 album_last_seen = {}
 
@@ -96,7 +95,6 @@ async def forward_message(event):
         return
     try:
         message = event.message
-        # Use channel title (pretty display name) if available!
         source_name = getattr(chat, 'title', None) or uname or cid
         tag = f"Source: {source_name}"
         if message.grouped_id:
@@ -107,11 +105,13 @@ async def forward_message(event):
         elif message.media:
             clean_caption = remove_mentions(message.text) if message.text else ""
             caption_with_source = f"{clean_caption}\n\n{tag}".strip() if show_source else clean_caption
-            await client.send_file(destination_channel, file=event.message, caption=caption_with_source)
+            for dest in destination_channels:
+                await client.send_file(dest, file=event.message, caption=caption_with_source)
         elif message.text:
             clean_text = remove_mentions(message.text)
             text_with_source = f"{clean_text}\n\n{tag}".strip() if show_source else clean_text
-            await client.send_message(destination_channel, text_with_source)
+            for dest in destination_channels:
+                await client.send_message(dest, text_with_source)
     except FloodWaitError as e:
         await asyncio.sleep(e.seconds)
         await forward_message(event)
@@ -134,18 +134,47 @@ async def process_album(group_id):
     tag = events_group[0][1]
     clean_caption = remove_mentions(events_group[0][0].message.text) if events_group[0][0].message.text else ""
     caption_with_source = f"{clean_caption}\n\n{tag}".strip() if show_source else clean_caption
-    try:
-        await client.send_file(destination_channel, file=files, caption=caption_with_source)
-    except Exception as e:
-        logging.error(f"Error forwarding album: {e}")
+    for dest in destination_channels:
+        try:
+            await client.send_file(dest, file=files, caption=caption_with_source)
+        except Exception as e:
+            logging.error(f"Error forwarding album: {e}")
 
 @client.on(events.NewMessage(pattern=r'^/'))
 async def admin_commands(event):
-    global forwarding_enabled, source_channels, destination_channel, admin_ids, show_source
+    global forwarding_enabled, source_channels, destination_channels, admin_ids, show_source
     sender = event.sender_id
     cmd = event.raw_text.strip()
 
     if sender not in admin_ids:
+        return
+
+    # --- Add/Remove/Set destination channel(s) ---
+    if cmd.startswith("/adddest "):
+        ch = cmd.split(maxsplit=1)[1].strip()
+        if ch not in destination_channels:
+            destination_channels.append(ch)
+            save_config(source_channels, destination_channels, admin_ids, show_source)
+            await event.reply(f"✅ Added destination: {ch}")
+        else:
+            await event.reply("Channel already in destination list.")
+        return
+
+    if cmd.startswith("/removedest "):
+        ch = cmd.split(maxsplit=1)[1].strip()
+        if ch in destination_channels:
+            destination_channels.remove(ch)
+            save_config(source_channels, destination_channels, admin_ids, show_source)
+            await event.reply(f"✅ Removed destination: {ch}")
+        else:
+            await event.reply("Channel not found in destination list.")
+        return
+
+    if cmd.startswith("/setdest "):
+        chans = [c.strip() for c in cmd.split(maxsplit=1)[1].split(",") if c.strip()]
+        destination_channels = chans
+        save_config(source_channels, destination_channels, admin_ids, show_source)
+        await event.reply(f"✅ Destination channels set to: {', '.join(destination_channels)}")
         return
 
     # --- Add admin by user ID or reply ---
@@ -158,7 +187,7 @@ async def admin_commands(event):
                     await event.reply(f"User ID {new_admin} is already an admin.")
                 else:
                     admin_ids.add(new_admin)
-                    save_config(source_channels, destination_channel, admin_ids, show_source)
+                    save_config(source_channels, destination_channels, admin_ids, show_source)
                     await event.reply(f"✅ Added admin by reply: `{new_admin}` (Saved to config.json)")
         else:
             parts = cmd.split()
@@ -169,7 +198,7 @@ async def admin_commands(event):
                         await event.reply(f"User ID {new_admin} is already an admin.")
                     else:
                         admin_ids.add(new_admin)
-                        save_config(source_channels, destination_channel, admin_ids, show_source)
+                        save_config(source_channels, destination_channels, admin_ids, show_source)
                         await event.reply(f"✅ Added admin: `{new_admin}` (Saved to config.json)")
                 except Exception:
                     await event.reply("❌ Usage: /addadmin <user_id>")
@@ -189,7 +218,7 @@ async def admin_commands(event):
                     await event.reply("❌ At least one admin must remain.")
                 else:
                     admin_ids.remove(remove_admin)
-                    save_config(source_channels, destination_channel, admin_ids, show_source)
+                    save_config(source_channels, destination_channels, admin_ids, show_source)
                     await event.reply(f"✅ Removed admin by reply: `{remove_admin}` (Saved to config.json)")
         else:
             parts = cmd.split()
@@ -202,7 +231,7 @@ async def admin_commands(event):
                         await event.reply("❌ At least one admin must remain.")
                     else:
                         admin_ids.remove(remove_admin)
-                        save_config(source_channels, destination_channel, admin_ids, show_source)
+                        save_config(source_channels, destination_channels, admin_ids, show_source)
                         await event.reply(f"✅ Removed admin: `{remove_admin}` (Saved to config.json)")
                 except Exception:
                     await event.reply("❌ Usage: /removeadmin <user_id>")
@@ -224,7 +253,7 @@ async def admin_commands(event):
             reply_msg = await event.get_reply_message()
             if reply_msg and reply_msg.file:
                 await reply_msg.download_media(CONFIG_FILE)
-                source_channels, destination_channel, admin_ids, show_source = load_config()
+                source_channels, destination_channels, admin_ids, show_source = load_config()
                 await event.reply("✅ Config restored from uploaded file!")
             else:
                 await event.reply("Please reply to a config.json file with /restore.")
@@ -252,18 +281,17 @@ async def admin_commands(event):
                 await event.reply(f"Channel {resolved_username or resolved_id} already in the source list.")
             else:
                 source_channels.append({'id': resolved_id, 'username': resolved_username})
-                save_config(source_channels, destination_channel, admin_ids, show_source)
+                save_config(source_channels, destination_channels, admin_ids, show_source)
                 await event.reply(f"✅ Added source: {resolved_username or resolved_id} (ID: {resolved_id}) (Saved to config.json!)")
         except Exception as e:
             await event.reply(f"❌ Could not resolve {ch}: {e}")
         return
 
-    # --- TOGGLE for "Source:" tag ---
     if cmd.startswith("/showsource"):
         parts = cmd.split()
         if len(parts) == 2 and parts[1] in ("on", "off"):
             show_source = (parts[1] == "on")
-            save_config(source_channels, destination_channel, admin_ids, show_source)
+            save_config(source_channels, destination_channels, admin_ids, show_source)
             await event.reply(f"✅ Source tag in forwarded messages is now {'ON' if show_source else 'OFF'}.")
         else:
             await event.reply("Usage: /showsource on  or  /showsource off")
@@ -278,7 +306,9 @@ async def admin_commands(event):
             "/showconfig - Show current channels\n"
             "/addsource <channel username or id>\n"
             "/removesource <channel id>\n"
-            "/setdest <channel>\n"
+            "/adddest <channel username or id>\n"
+            "/removedest <channel username or id>\n"
+            "/setdest <ch1,ch2,...>  - full replace\n"
             "/showsource on|off - Toggle 'Source:' in forwards\n"
             "/addadmin <user_id> or reply to user\n"
             "/removeadmin <user_id> or reply to user\n"
@@ -301,22 +331,17 @@ async def admin_commands(event):
         ]
         await event.reply(
             "Sources:\n" + "\n".join(pretty_sources) +
-            f"\nDestination: {destination_channel}\nAdmins: {list(admin_ids)}\nShow source tag: {show_source}"
+            f"\nDestinations: {destination_channels}\nAdmins: {list(admin_ids)}\nShow source tag: {show_source}"
         )
     elif cmd.startswith("/removesource "):
         ch = cmd.split(maxsplit=1)[1].strip()
         before = len(source_channels)
         source_channels = [sc for sc in source_channels if sc['id'] != ch]
         if len(source_channels) < before:
-            save_config(source_channels, destination_channel, admin_ids, show_source)
+            save_config(source_channels, destination_channels, admin_ids, show_source)
             await event.reply(f"✅ Removed source channel: {ch} (Saved to config.json!)")
         else:
             await event.reply(f"Channel ID {ch} not found in source list.")
-    elif cmd.startswith("/setdest "):
-        ch = cmd.split(maxsplit=1)[1].strip()
-        destination_channel = ch
-        save_config(source_channels, destination_channel, admin_ids, show_source)
-        await event.reply(f"✅ Destination set to: {ch} (Saved to config.json!)")
     else:
         await event.reply("❓ Unknown command. Type /help.")
 
