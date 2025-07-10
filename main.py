@@ -31,13 +31,12 @@ if not os.path.exists('sessions'):
 client = TelegramClient('sessions/forwarder_session', api_id, api_hash)
 forwarding_enabled = True
 
-# --- Persistent config with multi-admin and (username, id) sources ---
+# --- Persistent config with multi-admin and (username, id, title) sources ---
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
                 data = json.load(f)
-                # fallback to [] if source_channels is missing
                 sources = [dict(x) for x in data.get("source_channels", [])]
                 return (
                     sources,
@@ -56,7 +55,7 @@ def save_config(source_channels, destination_channel, admin_ids):
                 "source_channels": [dict(x) for x in source_channels],
                 "destination_channel": destination_channel,
                 "admin_ids": list(admin_ids)
-            }, f)
+            }, f, indent=2)
     except Exception as e:
         logging.error(f"Failed to save config: {e}")
 
@@ -238,28 +237,34 @@ async def admin_commands(event):
             await event.reply("Reply to a config.json file with /restore.")
         return
 
-    # ---- /addsource stores username + id ----
+    # ---- /addsource stores username + id + title ----
     if cmd.startswith("/addsource "):
         ch = cmd.split(maxsplit=1)[1].strip()
         try:
             if ch.lstrip("-").isdigit():
                 resolved_id = ch
                 resolved_username = None
+                resolved_title = None
                 try:
                     entity = await client.get_entity(int(resolved_id))
                     resolved_username = getattr(entity, "username", None)
+                    resolved_title = getattr(entity, "title", None)
                 except Exception:
                     pass
             else:
                 entity = await client.get_entity(ch)
                 resolved_id = str(entity.id)
                 resolved_username = getattr(entity, "username", None)
+                resolved_title = getattr(entity, "title", None)
             if any(sc['id'] == resolved_id for sc in source_channels):
-                await event.reply(f"Channel {resolved_username or resolved_id} already in the source list.")
+                await event.reply(f"Channel {resolved_title or resolved_username or resolved_id} already in the source list.")
             else:
-                source_channels.append({'id': resolved_id, 'username': resolved_username})
+                source_channels.append({'id': resolved_id, 'username': resolved_username, 'title': resolved_title})
                 save_config(source_channels, destination_channel, admin_ids)
-                await event.reply(f"✅ Added source: {resolved_username or resolved_id} (ID: {resolved_id}) (Saved to config.json!)")
+                await event.reply(
+                    f"✅ Added source: {resolved_title or resolved_username or resolved_id} "
+                    f"(ID: {resolved_id}) (Saved to config.json!)"
+                )
         except Exception as e:
             await event.reply(f"❌ Could not resolve {ch}: {e}")
         return
@@ -289,13 +294,14 @@ async def admin_commands(event):
         status = "enabled ✅" if forwarding_enabled else "paused ⛔"
         await event.reply(f"Bot forwarding is currently *{status}*.")
     elif cmd == "/showconfig":
-        pretty_sources = [
-            f"{sc['username'] or '[NO_USERNAME]'} ({sc['id']})"
-            for sc in source_channels
-        ]
+        pretty_sources = []
+        for i, sc in enumerate(source_channels, 1):
+            pretty_sources.append(
+                f"{i}. {sc.get('title') or '[NO_TITLE]'} (id: {sc['id']}, username: {sc.get('username') or '[NO_USERNAME]'})"
+            )
         await event.reply(
-            f"Sources: {pretty_sources}\n"
-            f"Destination: {destination_channel}\nAdmins: {list(admin_ids)}"
+            "Sources:\n" + "\n".join(pretty_sources) +
+            f"\nDestination: {destination_channel}\nAdmins: {list(admin_ids)}"
         )
     elif cmd.startswith("/removesource "):
         ch = cmd.split(maxsplit=1)[1].strip()
