@@ -80,7 +80,7 @@ async def forward_message(event):
     chat = await event.get_chat()
     uname = getattr(chat, "username", None)
     cid = str(getattr(chat, "id", None))
-    print(f"[DEBUG] Got msg from: username={uname} id={cid} in source_channels={source_channels}")
+    print(f"[ALL_MSGS] username={uname}, id={cid}, text={event.message.text[:40] if event.message.text else None}")
     # Only forward from allowed usernames or ids
     if not ((uname and uname.lower() in source_channels) or (cid in source_channels)):
         print(f"[SKIP] Message from {uname or cid} not in source_channels, skipping.")
