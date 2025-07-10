@@ -15,7 +15,7 @@ CONFIG_FILE = "config.json"
 load_dotenv()
 api_id = int(os.getenv("API_ID"))
 api_hash = os.getenv("API_HASH")
-initial_sources = [ch.strip().lower() for ch in os.getenv("SOURCE_CHANNELS", "").split(",") if ch.strip()]
+initial_sources = [ch.strip() for ch in os.getenv("SOURCE_CHANNELS", "").split(",") if ch.strip()]
 initial_dest = os.getenv("DEST_CHANNEL")
 default_admin = int(os.getenv("ADMIN_ID", "1121727322"))
 
@@ -38,7 +38,7 @@ def load_config():
             with open(CONFIG_FILE, "r") as f:
                 data = json.load(f)
                 return (
-                    [str(x).lower() for x in data.get("source_channels", [])],
+                    [str(x) for x in data.get("source_channels", [])],
                     data.get("destination_channel"),
                     set(int(x) for x in data.get("admin_ids", [default_admin]))
                 )
@@ -50,7 +50,7 @@ def save_config(source_channels, destination_channel, admin_ids):
     try:
         with open(CONFIG_FILE, "w") as f:
             json.dump({
-                "source_channels": [str(x).lower() for x in source_channels],
+                "source_channels": [str(x) for x in source_channels],
                 "destination_channel": destination_channel,
                 "admin_ids": list(admin_ids)
             }, f)
@@ -81,8 +81,8 @@ async def forward_message(event):
     uname = getattr(chat, "username", None)
     cid = str(getattr(chat, "id", None))
     print(f"[ALL_MSGS] username={uname}, id={cid}, text={event.message.text[:40] if event.message.text else None}")
-    # Only forward from allowed usernames or ids
-    if not ((uname and uname.lower() in source_channels) or (cid in source_channels)):
+    # Only forward from allowed channel ids
+    if cid not in source_channels:
         print(f"[SKIP] Message from {uname or cid} not in source_channels, skipping.")
         return
     if not forwarding_enabled:
@@ -228,7 +228,28 @@ async def admin_commands(event):
             await event.reply("Reply to a config.json file with /restore.")
         return
 
-    # ---- Standard admin commands below ----
+    # ---- Updated addsource handler ----
+    if cmd.startswith("/addsource "):
+        ch = cmd.split(maxsplit=1)[1].strip()
+        try:
+            if ch.lstrip("-").isdigit():
+                resolved_id = ch
+                display_name = ch
+            else:
+                entity = await client.get_entity(ch)
+                resolved_id = str(entity.id)
+                display_name = getattr(entity, "username", resolved_id)
+            if resolved_id in source_channels:
+                await event.reply(f"Channel {display_name} (ID: {resolved_id}) is already in the source list.")
+            else:
+                source_channels.append(resolved_id)
+                save_config(source_channels, destination_channel, admin_ids)
+                await event.reply(f"✅ Added source: {display_name} (ID: {resolved_id}) (Saved to config.json!)")
+        except Exception as e:
+            await event.reply(f"❌ Could not resolve {ch}: {e}")
+        return
+
+    # ---- Other admin commands below ----
     if cmd == "/help":
         await event.reply("Admin commands:\n"
                           "/start - Enable forwarding\n"
@@ -253,16 +274,8 @@ async def admin_commands(event):
         await event.reply(f"Bot forwarding is currently *{status}*.")
     elif cmd == "/showconfig":
         await event.reply(f"Sources: {source_channels}\nDestination: {destination_channel}\nAdmins: {list(admin_ids)}")
-    elif cmd.startswith("/addsource "):
-        ch = cmd.split(maxsplit=1)[1].strip().lower()
-        if ch not in source_channels:
-            source_channels.append(ch)
-            save_config(source_channels, destination_channel, admin_ids)
-            await event.reply(f"✅ Added source channel: {ch} (Saved to config.json!)")
-        else:
-            await event.reply(f"Channel {ch} already in source list.")
     elif cmd.startswith("/removesource "):
-        ch = cmd.split(maxsplit=1)[1].strip().lower()
+        ch = cmd.split(maxsplit=1)[1].strip()
         if ch in source_channels:
             source_channels.remove(ch)
             save_config(source_channels, destination_channel, admin_ids)
