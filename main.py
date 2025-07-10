@@ -83,8 +83,10 @@ async def forward_message(event):
     print(f"[DEBUG] Got msg from: username={uname} id={cid} in source_channels={source_channels}")
     # Only forward from allowed usernames or ids
     if not ((uname and uname.lower() in source_channels) or (cid in source_channels)):
+        print(f"[SKIP] Message from {uname or cid} not in source_channels, skipping.")
         return
     if not forwarding_enabled:
+        print("[SKIP] Forwarding paused.")
         return
     try:
         message = event.message
