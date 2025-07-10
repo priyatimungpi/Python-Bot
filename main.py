@@ -31,7 +31,7 @@ if not os.path.exists('sessions'):
 client = TelegramClient('sessions/forwarder_session', api_id, api_hash)
 forwarding_enabled = True
 
-# --- Persistent config with multi-admin and (username, id, title) sources ---
+# --- Persistent config with multi-admin and (username, id) sources ---
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
@@ -75,12 +75,6 @@ def remove_mentions(text):
 def is_channel_allowed(cid):
     return any(str(cid) == str(sc['id']) for sc in source_channels)
 
-def get_username_for_id(cid):
-    for sc in source_channels:
-        if str(cid) == str(sc['id']):
-            return sc.get('username')
-    return None
-
 # --- Robust album (grouped media) debouncing ---
 album_buffer = defaultdict(list)
 album_last_seen = {}
@@ -100,7 +94,7 @@ async def forward_message(event):
         return
     try:
         message = event.message
-        source_name = getattr(chat, 'title', None) or uname or cid
+        source_name = uname or cid
         tag = f"Source: {source_name}"
         # Robust grouped media/album debouncing
         if message.grouped_id:
@@ -237,34 +231,28 @@ async def admin_commands(event):
             await event.reply("Reply to a config.json file with /restore.")
         return
 
-    # ---- /addsource stores username + id + title ----
+    # ---- /addsource stores username + id ----
     if cmd.startswith("/addsource "):
         ch = cmd.split(maxsplit=1)[1].strip()
         try:
             if ch.lstrip("-").isdigit():
                 resolved_id = ch
                 resolved_username = None
-                resolved_title = None
                 try:
                     entity = await client.get_entity(int(resolved_id))
                     resolved_username = getattr(entity, "username", None)
-                    resolved_title = getattr(entity, "title", None)
                 except Exception:
                     pass
             else:
                 entity = await client.get_entity(ch)
                 resolved_id = str(entity.id)
                 resolved_username = getattr(entity, "username", None)
-                resolved_title = getattr(entity, "title", None)
             if any(sc['id'] == resolved_id for sc in source_channels):
-                await event.reply(f"Channel {resolved_title or resolved_username or resolved_id} already in the source list.")
+                await event.reply(f"Channel {resolved_username or resolved_id} already in the source list.")
             else:
-                source_channels.append({'id': resolved_id, 'username': resolved_username, 'title': resolved_title})
+                source_channels.append({'id': resolved_id, 'username': resolved_username})
                 save_config(source_channels, destination_channel, admin_ids)
-                await event.reply(
-                    f"✅ Added source: {resolved_title or resolved_username or resolved_id} "
-                    f"(ID: {resolved_id}) (Saved to config.json!)"
-                )
+                await event.reply(f"✅ Added source: {resolved_username or resolved_id} (ID: {resolved_id}) (Saved to config.json!)")
         except Exception as e:
             await event.reply(f"❌ Could not resolve {ch}: {e}")
         return
@@ -294,18 +282,16 @@ async def admin_commands(event):
         status = "enabled ✅" if forwarding_enabled else "paused ⛔"
         await event.reply(f"Bot forwarding is currently *{status}*.")
     elif cmd == "/showconfig":
-        pretty_sources = []
-        for i, sc in enumerate(source_channels, 1):
-            pretty_sources.append(
-                f"{i}. {sc.get('title') or '[NO_TITLE]'} (id: {sc['id']}, username: {sc.get('username') or '[NO_USERNAME]'})"
-            )
+        pretty_sources = [
+            f"{i+1}. {sc.get('username') or '[NO_USERNAME]'} (id: {sc['id']})"
+            for i, sc in enumerate(source_channels)
+        ]
         await event.reply(
             "Sources:\n" + "\n".join(pretty_sources) +
             f"\nDestination: {destination_channel}\nAdmins: {list(admin_ids)}"
         )
     elif cmd.startswith("/removesource "):
         ch = cmd.split(maxsplit=1)[1].strip()
-        # Remove by ID only (not username)
         before = len(source_channels)
         source_channels = [sc for sc in source_channels if sc['id'] != ch]
         if len(source_channels) < before:
