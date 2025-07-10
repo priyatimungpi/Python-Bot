@@ -21,7 +21,7 @@ default_admin = int(os.getenv("ADMIN_ID", "1121727322"))
 
 logging.basicConfig(level=logging.WARNING, format='[%(asctime)s] %(levelname)s: %(message)s')
 
-if not all([api_id, api_hash, initial_sources, initial_dest]):
+if not all([api_id, api_hash, initial_dest]):
     logging.error("Missing one or more required environment variables.")
     exit(1)
 
@@ -31,26 +31,29 @@ if not os.path.exists('sessions'):
 client = TelegramClient('sessions/forwarder_session', api_id, api_hash)
 forwarding_enabled = True
 
-# --- Persistent config with multi-admin ---
+# --- Persistent config with multi-admin and (username, id) sources ---
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
                 data = json.load(f)
+                # fallback to [] if source_channels is missing
+                sources = [dict(x) for x in data.get("source_channels", [])]
                 return (
-                    [str(x) for x in data.get("source_channels", [])],
+                    sources,
                     data.get("destination_channel"),
                     set(int(x) for x in data.get("admin_ids", [default_admin]))
                 )
         except Exception as e:
             logging.error(f"Failed to load config: {e}")
-    return initial_sources, initial_dest, set([default_admin])
+    # fallback if first run
+    return [], initial_dest, set([default_admin])
 
 def save_config(source_channels, destination_channel, admin_ids):
     try:
         with open(CONFIG_FILE, "w") as f:
             json.dump({
-                "source_channels": [str(x) for x in source_channels],
+                "source_channels": [dict(x) for x in source_channels],
                 "destination_channel": destination_channel,
                 "admin_ids": list(admin_ids)
             }, f)
@@ -70,6 +73,15 @@ def remove_mentions(text):
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
+def is_channel_allowed(cid):
+    return any(str(cid) == str(sc['id']) for sc in source_channels)
+
+def get_username_for_id(cid):
+    for sc in source_channels:
+        if str(cid) == str(sc['id']):
+            return sc.get('username')
+    return None
+
 # --- Robust album (grouped media) debouncing ---
 album_buffer = defaultdict(list)
 album_last_seen = {}
@@ -81,8 +93,7 @@ async def forward_message(event):
     uname = getattr(chat, "username", None)
     cid = str(getattr(chat, "id", None))
     print(f"[ALL_MSGS] username={uname}, id={cid}, text={event.message.text[:40] if event.message.text else None}")
-    # Only forward from allowed channel ids
-    if cid not in source_channels:
+    if not is_channel_allowed(cid):
         print(f"[SKIP] Message from {uname or cid} not in source_channels, skipping.")
         return
     if not forwarding_enabled:
@@ -90,9 +101,8 @@ async def forward_message(event):
         return
     try:
         message = event.message
-        source_name = getattr(chat, 'title', None) or getattr(chat, 'username', None) or str(chat.id)
+        source_name = getattr(chat, 'title', None) or uname or cid
         tag = f"Source: {source_name}"
-
         # Robust grouped media/album debouncing
         if message.grouped_id:
             group_id = (event.chat_id, message.grouped_id)
@@ -228,41 +238,47 @@ async def admin_commands(event):
             await event.reply("Reply to a config.json file with /restore.")
         return
 
-    # ---- Updated addsource handler ----
+    # ---- /addsource stores username + id ----
     if cmd.startswith("/addsource "):
         ch = cmd.split(maxsplit=1)[1].strip()
         try:
             if ch.lstrip("-").isdigit():
                 resolved_id = ch
-                display_name = ch
+                resolved_username = None
+                try:
+                    entity = await client.get_entity(int(resolved_id))
+                    resolved_username = getattr(entity, "username", None)
+                except Exception:
+                    pass
             else:
                 entity = await client.get_entity(ch)
                 resolved_id = str(entity.id)
-                display_name = getattr(entity, "username", resolved_id)
-            if resolved_id in source_channels:
-                await event.reply(f"Channel {display_name} (ID: {resolved_id}) is already in the source list.")
+                resolved_username = getattr(entity, "username", None)
+            if any(sc['id'] == resolved_id for sc in source_channels):
+                await event.reply(f"Channel {resolved_username or resolved_id} already in the source list.")
             else:
-                source_channels.append(resolved_id)
+                source_channels.append({'id': resolved_id, 'username': resolved_username})
                 save_config(source_channels, destination_channel, admin_ids)
-                await event.reply(f"✅ Added source: {display_name} (ID: {resolved_id}) (Saved to config.json!)")
+                await event.reply(f"✅ Added source: {resolved_username or resolved_id} (ID: {resolved_id}) (Saved to config.json!)")
         except Exception as e:
             await event.reply(f"❌ Could not resolve {ch}: {e}")
         return
 
-    # ---- Other admin commands below ----
     if cmd == "/help":
-        await event.reply("Admin commands:\n"
-                          "/start - Enable forwarding\n"
-                          "/stop - Pause forwarding\n"
-                          "/status - Show if bot is forwarding\n"
-                          "/showconfig - Show current channels\n"
-                          "/addsource <channel or chat_id>\n"
-                          "/removesource <channel or chat_id>\n"
-                          "/setdest <channel>\n"
-                          "/addadmin <user_id> or reply to user\n"
-                          "/removeadmin <user_id> or reply to user\n"
-                          "/backup - Download config.json\n"
-                          "/restore (reply to file) - Restore config.json")
+        await event.reply(
+            "Admin commands:\n"
+            "/start - Enable forwarding\n"
+            "/stop - Pause forwarding\n"
+            "/status - Show if bot is forwarding\n"
+            "/showconfig - Show current channels\n"
+            "/addsource <channel username or id>\n"
+            "/removesource <channel id>\n"
+            "/setdest <channel>\n"
+            "/addadmin <user_id> or reply to user\n"
+            "/removeadmin <user_id> or reply to user\n"
+            "/backup - Download config.json\n"
+            "/restore (reply to file) - Restore config.json"
+        )
     elif cmd == "/start":
         forwarding_enabled = True
         await event.reply("✅ Forwarding enabled!")
@@ -273,15 +289,24 @@ async def admin_commands(event):
         status = "enabled ✅" if forwarding_enabled else "paused ⛔"
         await event.reply(f"Bot forwarding is currently *{status}*.")
     elif cmd == "/showconfig":
-        await event.reply(f"Sources: {source_channels}\nDestination: {destination_channel}\nAdmins: {list(admin_ids)}")
+        pretty_sources = [
+            f"{sc['username'] or '[NO_USERNAME]'} ({sc['id']})"
+            for sc in source_channels
+        ]
+        await event.reply(
+            f"Sources: {pretty_sources}\n"
+            f"Destination: {destination_channel}\nAdmins: {list(admin_ids)}"
+        )
     elif cmd.startswith("/removesource "):
         ch = cmd.split(maxsplit=1)[1].strip()
-        if ch in source_channels:
-            source_channels.remove(ch)
+        # Remove by ID only (not username)
+        before = len(source_channels)
+        source_channels = [sc for sc in source_channels if sc['id'] != ch]
+        if len(source_channels) < before:
             save_config(source_channels, destination_channel, admin_ids)
             await event.reply(f"✅ Removed source channel: {ch} (Saved to config.json!)")
         else:
-            await event.reply(f"Channel {ch} not found in source list.")
+            await event.reply(f"Channel ID {ch} not found in source list.")
     elif cmd.startswith("/setdest "):
         ch = cmd.split(maxsplit=1)[1].strip()
         destination_channel = ch
