@@ -31,7 +31,6 @@ if not os.path.exists('sessions'):
 client = TelegramClient('sessions/forwarder_session', api_id, api_hash)
 forwarding_enabled = True
 
-# --- Persistent config with multi-admin and (username, id) sources ---
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
@@ -45,7 +44,6 @@ def load_config():
                 )
         except Exception as e:
             logging.error(f"Failed to load config: {e}")
-    # fallback if first run
     return [], initial_dest, set([default_admin])
 
 def save_config(source_channels, destination_channel, admin_ids):
@@ -94,9 +92,9 @@ async def forward_message(event):
         return
     try:
         message = event.message
-        source_name = uname or cid
+        # USE TITLE (pretty display name) IF AVAILABLE!
+        source_name = getattr(chat, 'title', None) or uname or cid
         tag = f"Source: {source_name}"
-        # Robust grouped media/album debouncing
         if message.grouped_id:
             group_id = (event.chat_id, message.grouped_id)
             album_buffer[group_id].append((event, tag))
@@ -137,7 +135,6 @@ async def process_album(group_id):
     except Exception as e:
         logging.error(f"Error forwarding album: {e}")
 
-# --- Admin commands, only handle '/' and from admin! ---
 @client.on(events.NewMessage(pattern=r'^/'))
 async def admin_commands(event):
     global forwarding_enabled, source_channels, destination_channel, admin_ids
