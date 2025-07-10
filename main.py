@@ -80,7 +80,6 @@ async def forward_message(event):
     chat = await event.get_chat()
     uname = getattr(chat, "username", None)
     cid = str(getattr(chat, "id", None))
-logging.warning(f"Got msg from: username={uname} id={cid} in source_channels={source_channels}")
     # Only forward from allowed usernames or ids
     if not ((uname and uname.lower() in source_channels) or (cid in source_channels)):
         return
